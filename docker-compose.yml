@@ -1,0 +1,62 @@
+# Example stack showing how to use docker-volume-backup.
+#
+# The backup service starts first (all other services depend on it being
+# healthy). On a fresh deploy it restores the latest backup from S3 into the
+# empty named volumes before anything else starts. After that it backs up
+# all named volumes of this project on the configured cron schedule.
+
+services:
+  backup:
+    image: ghcr.io/sander-van-damme/docker-volume-backup:latest
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      # --- S3 target (any S3-compatible provider) ---
+      S3_BUCKET: my-backup-bucket                 # required
+      AWS_ACCESS_KEY_ID: change-me                # required
+      AWS_SECRET_ACCESS_KEY: change-me            # required
+      # S3_ENDPOINT: https://s3.eu-central-003.backblazeb2.com  # default: Backblaze B2
+      # S3_PREFIX: ""                             # default: bucket root
+
+      # --- schedule & retention ---
+      # BACKUP_CRON: "0 4 * * *"                  # default: daily at 04:00
+      # TZ: Europe/Brussels                       # default
+      # BACKUP_RETENTION: "31"                    # default: keep last 31 snapshots per volume
+
+      # --- encryption (off unless a password is set) ---
+      # RESTIC_PASSWORD: ""
+
+      # --- misc ---
+      # BACKUP_STOP_TIMEOUT: "30"                 # seconds to wait when stopping containers
+      # BACKUP_EXCLUDE_VOLUMES: ""                # comma-separated compose volume names to skip
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - backup-staging:/staging
+
+  # --- example application containers with volumes that get backed up ---
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    depends_on:
+      backup:
+        condition: service_healthy
+
+  web:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - media:/usr/share/nginx/html
+    depends_on:
+      backup:
+        condition: service_healthy
+
+volumes:
+  backup-staging:
+  db-data:
+  media:

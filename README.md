@@ -1,1 +1,130 @@
 # docker-volume-backup
+
+A single backup container for docker compose stacks. It backs up **all named
+volumes of its own compose project** to **any S3-compatible storage** using
+[restic](https://restic.net/) (incremental, deduplicated, optionally
+encrypted), and automatically **restores the latest backup on a fresh
+deploy** — a simple form of disaster recovery.
+
+## How it works
+
+- **Discovery through the Docker API.** The container inspects itself through
+  the docker socket, reads its `com.docker.compose.project` label and lists
+  all volumes carrying that project label. No custom labels or configuration
+  needed, and no guessing of host volume names (a compose volume `example`
+  may be called `example-y1fal5` or `myproject_example` on the host — the
+  labels are authoritative, the name never matters). Bind mounts and
+  anonymous volumes are not backed up. Volumes mounted into the backup
+  container itself (the staging volume) are excluded automatically.
+
+- **Minimal downtime.** At each scheduled backup, every running container
+  that uses one of the volumes is stopped, the volume contents are copied to
+  a local staging volume (fast), and the containers are started again.
+  Only then is the data uploaded to S3, in the background, while your stack
+  is already running again.
+
+- **Incremental + encrypted.** Uploads go through restic: only changed data
+  is uploaded and stored (deduplicated chunks), old snapshots are pruned per
+  the retention setting, and setting a password enables encryption.
+
+- **Automatic disaster recovery.** Start the backup service before everything
+  else via `depends_on: condition: service_healthy`. On start it checks every
+  named volume of the project:
+  - volume has data → left alone;
+  - volume is empty and a backup exists in S3 → the latest snapshot is
+    restored into it before dependent services start;
+  - volume is empty and there is no backup → left for the application to
+    initialize.
+
+  Volumes that are *intentionally* empty (e.g. a media volume that never got
+  content) get a `.docker-volume-backup.init` marker file at backup time, so
+  a fresh deploy remembers they are supposed to be empty and doesn't keep
+  looking for data to restore. The marker is only ever written to volumes
+  that are already empty while their containers run, so it never interferes
+  with applications (like PostgreSQL) that require an empty directory to
+  initialize.
+
+## Usage
+
+See [docker-compose.yml](docker-compose.yml) for a complete example. The
+essential parts:
+
+```yaml
+services:
+  backup:
+    image: ghcr.io/sander-van-damme/docker-volume-backup:latest
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      S3_BUCKET: my-backup-bucket
+      AWS_ACCESS_KEY_ID: ...
+      AWS_SECRET_ACCESS_KEY: ...
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - backup-staging:/staging
+
+  your-app:
+    # ...
+    depends_on:
+      backup:
+        condition: service_healthy
+
+volumes:
+  backup-staging:
+```
+
+Notes:
+
+- The docker socket mount is required (volume discovery, stopping/starting
+  containers, helper containers for copying volume data). No other special
+  privileges are needed.
+- The staging volume (`/staging`) must be large enough to hold an
+  uncompressed copy of all backed-up volumes.
+- Don't set a custom `hostname:` on the backup service — it identifies its
+  own container by hostname.
+- If the backup container fails to start (e.g. S3 unreachable on a fresh
+  deploy), dependent services intentionally stay down: starting an empty
+  stack when backups might exist could fork your data.
+
+## Configuration
+
+Everything is configured through environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `S3_BUCKET` | — (required) | Bucket to store backups in |
+| `AWS_ACCESS_KEY_ID` | — (required) | S3 access key |
+| `AWS_SECRET_ACCESS_KEY` | — (required) | S3 secret key |
+| `S3_ENDPOINT` | `https://s3.eu-central-003.backblazeb2.com` | Any S3-compatible endpoint (Backblaze B2 by default — pick your bucket's region endpoint) |
+| `S3_PREFIX` | *(empty — bucket root)* | Path prefix inside the bucket |
+| `BACKUP_CRON` | `0 4 * * *` | Backup schedule (standard 5-field cron) |
+| `TZ` | `Europe/Brussels` | Timezone the schedule is evaluated in |
+| `BACKUP_RETENTION` | `31` | Snapshots kept per volume (with the default daily schedule: 31 days) |
+| `RESTIC_PASSWORD` | *(empty — encryption off)* | Set to enable encryption. **Losing it means losing the backups.** Changing it later requires a new repository (new bucket/prefix). |
+| `BACKUP_STOP_TIMEOUT` | `30` | Seconds to wait for containers to stop gracefully |
+| `BACKUP_EXCLUDE_VOLUMES` | *(empty)* | Comma-separated compose volume names to skip |
+| `RESTIC_REPOSITORY` | *(derived from the S3 settings)* | Full restic repository override, for non-S3 backends |
+
+## Manual operations
+
+```sh
+# trigger a backup right now
+docker compose exec backup dvb backup
+
+# inspect snapshots (any restic command works through the dvb wrapper,
+# which fills in the repository and encryption settings)
+docker compose exec backup dvb restic snapshots
+
+# re-run the restore pass
+docker compose exec backup dvb restore
+```
+
+Since the repository is plain restic, you can also browse, mount or restore
+backups from any machine with restic installed.
+
+## Testing locally
+
+`./test/run-test.sh` runs a full end-to-end test against a local MinIO
+container: initial deploy, backup, retention, destroying all volumes, and
+verifying the automatic restore on redeploy (including the
+intentionally-empty-volume marker and the cron schedule).

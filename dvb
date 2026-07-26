@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+#
+# dvb — docker volume backup
+#
+# Backs up all named volumes of the docker compose project this container is
+# part of to any S3-compatible storage, using restic (incremental,
+# deduplicated, optionally encrypted). On a fresh deploy it restores the
+# latest backup into empty volumes before the rest of the stack starts.
+#
+# Subcommands:
+#   start    (default) restore-if-needed, then run the cron scheduler
+#   backup   run one backup cycle now
+#   restore  run the restore-if-needed pass now
+#
+set -euo pipefail
+
+# --------------------------------------------------------------------------
+# Configuration (all overridable through environment variables)
+# --------------------------------------------------------------------------
+: "${S3_ENDPOINT:=https://s3.eu-central-003.backblazeb2.com}"
+: "${S3_BUCKET:=}"
+: "${S3_PREFIX:=}"
+: "${BACKUP_CRON:=0 4 * * *}"
+: "${BACKUP_RETENTION:=31}"
+: "${BACKUP_STOP_TIMEOUT:=30}"
+: "${BACKUP_EXCLUDE_VOLUMES:=}"
+: "${TZ:=Europe/Brussels}"
+export TZ
+
+STAGING_DIR=/staging
+MARKER=.docker-volume-backup.init
+ENV_FILE=/run/dvb.env
+READY_FILE=/tmp/dvb-ready
+LOCK_FILE=/tmp/dvb.lock
+
+log() { printf '[dvb] %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+
+# --------------------------------------------------------------------------
+# restic setup: encryption is on when RESTIC_PASSWORD is set, off otherwise
+# --------------------------------------------------------------------------
+RESTIC_FLAGS=()
+if [[ -n "${RESTIC_PASSWORD:-}" ]]; then
+  export RESTIC_PASSWORD
+else
+  unset RESTIC_PASSWORD
+  RESTIC_FLAGS+=(--insecure-no-password)
+fi
+
+if [[ -z "${RESTIC_REPOSITORY:-}" ]]; then
+  [[ -n "$S3_BUCKET" ]] || die "S3_BUCKET (or RESTIC_REPOSITORY) must be set"
+  RESTIC_REPOSITORY="s3:${S3_ENDPOINT}/${S3_BUCKET}"
+  [[ -n "$S3_PREFIX" ]] && RESTIC_REPOSITORY+="/${S3_PREFIX#/}"
+fi
+export RESTIC_REPOSITORY
+
+restic_cmd() { restic --no-cache -q "${RESTIC_FLAGS[@]}" "$@"; }
+
+ensure_repo() {
+  # "cat config" answers fast on an existing repository but can retry for
+  # many minutes on a missing bucket, so bound it and fall through to init.
+  local attempt out
+  for attempt in 1 2 3 4 5; do
+    timeout 30 restic --no-cache "${RESTIC_FLAGS[@]}" cat config >/dev/null 2>&1 && return 0
+    log "no repository found at $RESTIC_REPOSITORY; initializing (attempt $attempt/5)"
+    if out=$(restic_cmd init 2>&1); then
+      return 0
+    fi
+    # A concurrent/earlier init may have won the race; that's fine.
+    grep -qi "already\|config file exists" <<<"$out" && return 0
+    log "$out"
+    sleep $((attempt * 2))
+  done
+  die "cannot reach or initialize the restic repository at $RESTIC_REPOSITORY"
+}
+
+# --------------------------------------------------------------------------
+# Self-inspection: find our own container, its compose project and the
+# staging volume through the Docker API. No custom labels needed.
+# --------------------------------------------------------------------------
+SELF_ID="" SELF_IMAGE="" PROJECT="" STAGING_VOL="" SELF_VOLS=""
+
+inspect_self() {
+  local hn
+  hn=$(cat /etc/hostname)
+  SELF_ID=$(docker inspect -f '{{.Id}}' "$hn" 2>/dev/null) \
+    || die "cannot find own container '$hn' via the Docker API (is the docker socket mounted, and is 'hostname:' left unset on the backup service?)"
+  SELF_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$SELF_ID")
+  PROJECT=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$SELF_ID")
+  [[ -n "$PROJECT" ]] || die "own container has no com.docker.compose.project label; the backup container must be started by docker compose"
+  SELF_VOLS=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' "$SELF_ID")
+  STAGING_VOL=$(docker inspect -f "{{range .Mounts}}{{if eq .Destination \"$STAGING_DIR\"}}{{.Name}}{{end}}{{end}}" "$SELF_ID")
+  [[ -n "$STAGING_VOL" ]] || die "no volume is mounted at $STAGING_DIR; add one to the backup service"
+}
+
+# Discover the project's named volumes. We match on compose labels only, so
+# the actual volume name on the host (e.g. "example-y1fal5" for external
+# volumes, or "<project>_example") never has to be guessed. Volumes mounted
+# into the backup container itself (staging) are excluded automatically.
+declare -a VOL_REAL=() VOL_NAME=()
+discover_volumes() {
+  VOL_REAL=() VOL_NAME=()
+  local v cname exclude=",${BACKUP_EXCLUDE_VOLUMES// /},"
+  while read -r v; do
+    [[ -n "$v" ]] || continue
+    grep -qxF "$v" <<<"$SELF_VOLS" && continue
+    cname=$(docker volume inspect -f '{{index .Labels "com.docker.compose.volume"}}' "$v" 2>/dev/null) || continue
+    [[ -n "$cname" ]] || continue
+    if [[ "$exclude" == *",$cname,"* ]]; then
+      log "volume '$cname' excluded via BACKUP_EXCLUDE_VOLUMES"
+      continue
+    fi
+    VOL_REAL+=("$v") VOL_NAME+=("$cname")
+  done < <(docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT")
+}
+
+# --------------------------------------------------------------------------
+# Helper containers: short-lived containers (same image, no pull needed)
+# that mount a target volume, since a running container cannot mount
+# volumes dynamically.
+# --------------------------------------------------------------------------
+helper() { # helper <volume:mountspec>... -- <sh -c command>
+  local -a mounts=()
+  while [[ "$1" != -- ]]; do mounts+=(-v "$1"); shift; done
+  shift
+  docker run --rm --network none --entrypoint sh "${mounts[@]}" "$SELF_IMAGE" -c "$1"
+}
+
+# Prints MARKER, DATA or EMPTY for a volume.
+probe_volume() {
+  helper "$1:/vol:ro" -- \
+    "if [ -e '/vol/$MARKER' ]; then echo MARKER; elif [ -n \"\$(ls -A /vol)\" ]; then echo DATA; else echo EMPTY; fi"
+}
+
+# --------------------------------------------------------------------------
+# Backup
+# --------------------------------------------------------------------------
+declare -a STOPPED=()
+restart_stopped() {
+  if ((${#STOPPED[@]})); then
+    log "starting ${#STOPPED[@]} container(s) again"
+    docker start "${STOPPED[@]}" >/dev/null || log "WARNING: failed to start some containers: ${STOPPED[*]}"
+    STOPPED=()
+  fi
+}
+
+cmd_backup() {
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || { log "another backup run is still in progress; skipping"; exit 0; }
+
+  inspect_self
+  discover_volumes
+  if ((${#VOL_REAL[@]} == 0)); then
+    log "no named volumes found in project '$PROJECT'; nothing to back up"
+    return 0
+  fi
+  log "backing up project '$PROJECT', volumes: ${VOL_NAME[*]}"
+
+  # Verify the repository is reachable BEFORE stopping anything, so an
+  # unreachable S3 target never causes downtime.
+  ensure_repo
+
+  # Find all running containers that use any of the volumes (except us).
+  local v ids
+  ids=$(for v in "${VOL_REAL[@]}"; do docker ps -q --no-trunc --filter "volume=$v"; done | sort -u | grep -vx "$SELF_ID" || true)
+
+  local -a users=()
+  [[ -n "$ids" ]] && mapfile -t users <<<"$ids"
+
+  trap restart_stopped EXIT
+  if ((${#users[@]})); then
+    log "stopping ${#users[@]} container(s) using the volumes"
+    docker stop -t "$BACKUP_STOP_TIMEOUT" "${users[@]}" >/dev/null
+    STOPPED=("${users[@]}")
+  fi
+
+  # Copy volume contents to the staging volume (fast, local) while the
+  # containers are down.
+  local i name real
+  for i in "${!VOL_REAL[@]}"; do
+    real=${VOL_REAL[$i]} name=${VOL_NAME[$i]}
+    if [[ "$(probe_volume "$real")" == EMPTY ]]; then
+      # Remember that this volume is intentionally empty, so a fresh deploy
+      # will not look for data to restore into it.
+      log "volume '$name' is empty; writing init marker"
+      helper "$real:/vol" -- "touch '/vol/$MARKER'"
+    fi
+    log "staging volume '$name' ($real)"
+    mkdir -p "$STAGING_DIR/$name"
+    helper "$real:/vol:ro" "$STAGING_VOL:$STAGING_DIR" -- \
+      "rsync -aH --delete /vol/ '$STAGING_DIR/$name/'"
+  done
+
+  # Start the containers again before uploading: the upload happens in the
+  # background as far as the application stack is concerned.
+  restart_stopped
+  trap - EXIT
+
+  local start_ts=$SECONDS
+  for name in "${VOL_NAME[@]}"; do
+    log "uploading snapshot of '$name'"
+    restic_cmd backup --host "$PROJECT" --ignore-inode "$STAGING_DIR/$name"
+  done
+  log "applying retention: keeping last $BACKUP_RETENTION snapshot(s) per volume"
+  restic_cmd forget --host "$PROJECT" --group-by paths --keep-last "$BACKUP_RETENTION" --prune
+  log "backup finished (upload took $((SECONDS - start_ts))s)"
+}
+
+# --------------------------------------------------------------------------
+# Restore (automatic disaster recovery on fresh deploys)
+# --------------------------------------------------------------------------
+cmd_restore() {
+  discover_volumes
+  if ((${#VOL_REAL[@]} == 0)); then
+    log "no named volumes found in project '$PROJECT'"
+    return 0
+  fi
+
+  ensure_repo
+
+  local i name real state snaps
+  for i in "${!VOL_REAL[@]}"; do
+    real=${VOL_REAL[$i]} name=${VOL_NAME[$i]}
+    state=$(probe_volume "$real")
+    case "$state" in
+      MARKER)
+        log "volume '$name' already initialized; skipping restore" ;;
+      DATA)
+        log "volume '$name' contains data; skipping restore" ;;
+      EMPTY)
+        snaps=$(restic_cmd snapshots --json --latest 1 --path "$STAGING_DIR/$name" 2>/dev/null | jq -r 'if . == null then 0 else length end')
+        if [[ "$snaps" == 0 ]]; then
+          log "volume '$name' is empty and has no backups; leaving it for the application to initialize"
+          continue
+        fi
+        log "volume '$name' is empty and a backup exists; restoring latest snapshot"
+        rm -rf "${STAGING_DIR:?}/${name:?}"
+        restic_cmd restore latest --path "$STAGING_DIR/$name" --target /
+        helper "$real:/vol" "$STAGING_VOL:$STAGING_DIR:ro" -- \
+          "rsync -aH '$STAGING_DIR/$name/' /vol/"
+        log "volume '$name' restored" ;;
+    esac
+  done
+}
+
+# --------------------------------------------------------------------------
+# Start: restore if needed, mark healthy, then schedule backups with cron
+# --------------------------------------------------------------------------
+cmd_start() {
+  log "docker-volume-backup starting (repository: $RESTIC_REPOSITORY, encryption: $([[ -n "${RESTIC_PASSWORD:-}" ]] && echo on || echo off))"
+
+  local i
+  for i in $(seq 1 30); do
+    docker info >/dev/null 2>&1 && break
+    [[ $i == 30 ]] && die "cannot reach the Docker API; mount /var/run/docker.sock into this container"
+    sleep 1
+  done
+
+  inspect_self
+  cmd_restore
+
+  # crond does not pass the container environment to jobs; persist it.
+  export -p >"$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  mkdir -p /etc/crontabs
+  printf '%s bash -c ". %s; exec /usr/local/bin/dvb backup" >>/proc/1/fd/1 2>&1\n' \
+    "$BACKUP_CRON" "$ENV_FILE" >/etc/crontabs/root
+
+  touch "$READY_FILE"
+  log "ready; scheduling backups at '$BACKUP_CRON' ($TZ)"
+  exec crond -f -l 6
+}
+
+case "${1:-start}" in
+  start)   cmd_start ;;
+  backup)  cmd_backup ;;
+  restore) inspect_self; cmd_restore ;;
+  restic)  shift; exec restic --no-cache "${RESTIC_FLAGS[@]}" "$@" ;;
+  *)       exec "$@" ;;
+esac

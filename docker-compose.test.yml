@@ -1,0 +1,63 @@
+# Local end-to-end test stack. Expects a MinIO instance reachable as
+# "minio" on the external network "dvb-s3" (see test/run-test.sh).
+
+services:
+  backup:
+    build: .
+    restart: unless-stopped
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: dvb-test
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      BACKUP_CRON: "* * * * *"
+      BACKUP_RETENTION: "5"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - backup-staging:/staging
+    networks:
+      - default
+      - s3
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    depends_on:
+      backup:
+        condition: service_healthy
+
+  app:
+    image: alpine:3.22
+    init: true
+    command: sh -c 'echo "hello from app $$(date)" > /data/hello.txt && sleep infinity'
+    volumes:
+      - app-data:/data
+    depends_on:
+      backup:
+        condition: service_healthy
+
+  # media stays empty on purpose: tests the "intentionally empty" marker.
+  # (mounted at an empty path — alpine's /media is not empty in the image)
+  media-user:
+    image: alpine:3.22
+    init: true
+    command: sleep infinity
+    volumes:
+      - media:/srv/media
+    depends_on:
+      backup:
+        condition: service_healthy
+
+networks:
+  s3:
+    external: true
+    name: dvb-s3
+
+volumes:
+  backup-staging:
+  db-data:
+  app-data:
+  media:
