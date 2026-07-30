@@ -158,3 +158,10 @@ Change visibility* if you want to pull it without logging in.
 container: initial deploy, backup, retention, destroying all volumes, and
 verifying the automatic restore on redeploy (including the
 intentionally-empty-volume marker and the cron schedule).
+
+`./test/failure/run-all.sh` is the counterpart that breaks things on
+purpose — S3 outages and blackholes, crashes mid-backup, misconfiguration,
+`depends_on` mistakes, a full staging volume, and multi-project scoping. It
+takes considerably longer (several scenarios wait out multi-minute retry
+budgets) and is not part of CI. See
+[test/failure/FINDINGS.md](test/failure/FINDINGS.md) for what it turned up.

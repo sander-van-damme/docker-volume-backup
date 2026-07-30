@@ -1,0 +1,50 @@
+# Lab stack: a realistic compose project using the backup container.
+services:
+  backup:
+    image: ${DVB_IMAGE:-dvb:test}
+    restart: unless-stopped
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${BUCKET:-dvblab}
+      S3_PREFIX: ${PREFIX:-}
+      AWS_ACCESS_KEY_ID: ${AKID:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${SECRET:-minioadmin}
+      BACKUP_CRON: ${CRON:-0 4 * * *}
+      BACKUP_RETENTION: ${RETENTION:-3}
+      BACKUP_EXCLUDE_VOLUMES: ${EXCLUDE:-}
+      RESTIC_PASSWORD: ${RPASS:-}
+      BACKUP_STOP_TIMEOUT: ${STOP_TIMEOUT:-10}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - backup-staging:/staging
+    networks: [default, s3]
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    depends_on:
+      backup:
+        condition: service_healthy
+
+  app:
+    image: alpine:3.22
+    init: true
+    command: sh -c 'mkdir -p /data && [ -f /data/hello.txt ] || echo "app-payload-v1" > /data/hello.txt; sleep infinity'
+    volumes:
+      - app-data:/data
+    depends_on:
+      backup:
+        condition: service_healthy
+
+networks:
+  s3:
+    external: true
+    name: dvblab-s3
+
+volumes:
+  backup-staging:
+  db-data:
+  app-data:

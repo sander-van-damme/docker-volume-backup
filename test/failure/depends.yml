@@ -1,0 +1,57 @@
+# Stack that deliberately gets depends_on wrong, to see what breaks.
+services:
+  backup:
+    image: ${DVB_IMAGE:-dvb:test}
+    restart: unless-stopped
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: dvblab
+      S3_PREFIX: depends
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      BACKUP_CRON: "0 4 * * *"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - backup-staging:/staging
+    networks: [default, s3]
+
+  # CORRECT: waits for the restore pass to finish.
+  good:
+    image: alpine:3.22
+    init: true
+    command: sh -c '[ -f /data/payload ] || echo FRESH-INIT > /data/payload; sleep infinity'
+    volumes:
+      - good-data:/data
+    depends_on:
+      backup:
+        condition: service_healthy
+
+  # WRONG #1: no depends_on at all — races the restore.
+  nodep:
+    image: alpine:3.22
+    init: true
+    command: sh -c '[ -f /data/payload ] || echo FRESH-INIT > /data/payload; sleep infinity'
+    volumes:
+      - nodep-data:/data
+
+  # WRONG #2: depends_on without a condition — only waits for "started",
+  # which for a non-healthcheck dependency means the container process exists.
+  weakdep:
+    image: alpine:3.22
+    init: true
+    command: sh -c '[ -f /data/payload ] || echo FRESH-INIT > /data/payload; sleep infinity'
+    volumes:
+      - weakdep-data:/data
+    depends_on:
+      - backup
+
+networks:
+  s3:
+    external: true
+    name: dvblab-s3
+
+volumes:
+  backup-staging:
+  good-data:
+  nodep-data:
+  weakdep-data:

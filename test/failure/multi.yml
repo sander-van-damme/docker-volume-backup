@@ -1,0 +1,36 @@
+# Two independent projects, same bucket, same prefix, same volume name.
+services:
+  backup:
+    image: ${DVB_IMAGE:-dvb:test}
+    restart: unless-stopped
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: dvblab
+      S3_PREFIX: shared
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      BACKUP_CRON: "0 4 * * *"
+      BACKUP_RETENTION: ${RETENTION:-3}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - backup-staging:/staging
+    networks: [default, s3]
+
+  worker:
+    image: alpine:3.22
+    init: true
+    command: sh -c '[ -f /data/payload ] || echo FRESH > /data/payload; sleep infinity'
+    volumes:
+      - data:/data
+    depends_on:
+      backup:
+        condition: service_healthy
+
+networks:
+  s3:
+    external: true
+    name: dvblab-s3
+
+volumes:
+  backup-staging:
+  data:
