@@ -1,5 +1,7 @@
 # docker-volume-backup
 
+[![Build and publish image](https://github.com/sander-van-damme/docker-volume-backup/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/sander-van-damme/docker-volume-backup/actions/workflows/docker-publish.yml)
+
 A single backup container for docker compose stacks. It backs up **all named
 volumes of its own compose project** to **any S3-compatible storage** using
 [restic](https://restic.net/) (incremental, deduplicated, optionally
@@ -121,6 +123,23 @@ docker compose exec backup dvb restore
 
 Since the repository is plain restic, you can also browse, mount or restore
 backups from any machine with restic installed.
+
+## Published image
+
+The image is built and pushed to the GitHub container registry by
+[.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml),
+for `linux/amd64` and `linux/arm64`:
+
+| Trigger | Tags published |
+|---|---|
+| push to `main` | `latest`, `sha-<commit>` |
+| push of a `v*` tag (e.g. `v1.2.3`) | `1.2.3`, `1.2`, `1`, `sha-<commit>` |
+| pull request | *none* — the image is built as a check only |
+
+Nothing needs to be configured: the workflow authenticates to `ghcr.io` with
+the automatic `GITHUB_TOKEN`. The package itself starts out private, so make
+it public once under *Packages → docker-volume-backup → Package settings →
+Change visibility* if you want to pull it without logging in.
 
 ## Testing locally
 
