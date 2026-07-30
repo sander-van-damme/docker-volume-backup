@@ -44,7 +44,8 @@ deploy** — a simple form of disaster recovery.
   looking for data to restore. The marker is only ever written to volumes
   that are already empty while their containers run, so it never interferes
   with applications (like PostgreSQL) that require an empty directory to
-  initialize.
+  initialize. Once real data appears in the volume, the next backup removes
+  the marker again.
 
 ## Usage
 
@@ -78,8 +79,17 @@ volumes:
 Notes:
 
 - The docker socket mount is required (volume discovery, stopping/starting
-  containers, helper containers for copying volume data). No other special
-  privileges are needed.
+  containers, helper containers for copying volume data). Be aware of what
+  that means: access to the docker socket is equivalent to root on the host,
+  so only run this container (like anything else with the socket mounted) if
+  you trust the image and the machine is yours to administer.
+- Backups and restores are scoped to the compose project name (the restic
+  `host`). Two projects can safely share one bucket/prefix — one project will
+  never restore or prune another's snapshots. The flip side: renaming a
+  project (or its directory) makes existing backups invisible to the
+  automatic restore and to retention. After a rename, prune the old
+  snapshots manually (`dvb restic forget --host <old-name> ...`) or copy
+  them over.
 - The staging volume (`/staging`) must be large enough to hold an
   uncompressed copy of all backed-up volumes.
 - Don't set a custom `hostname:` on the backup service — it identifies its
@@ -128,7 +138,8 @@ backups from any machine with restic installed.
 
 The image is built and pushed to the GitHub container registry by
 [.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml),
-for `linux/amd64` and `linux/arm64`:
+for `linux/amd64` and `linux/arm64`. Publishing is gated on the end-to-end
+test (see below) passing in CI:
 
 | Trigger | Tags published |
 |---|---|

@@ -6,7 +6,6 @@ RUN apk add --no-cache bash restic docker-cli jq rsync tzdata ca-certificates
 ENV TZ=Europe/Brussels
 
 COPY dvb /usr/local/bin/dvb
-RUN chmod +x /usr/local/bin/dvb
 
 VOLUME /staging
 

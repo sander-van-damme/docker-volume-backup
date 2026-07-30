@@ -32,6 +32,9 @@ MARKER=.docker-volume-backup.init
 ENV_FILE=/run/dvb.env
 READY_FILE=/tmp/dvb-ready
 LOCK_FILE=/tmp/dvb.lock
+# Lives on the staging volume so it survives crashes and recreations of this
+# container while application containers are stopped for a backup.
+STOPPED_FILE=$STAGING_DIR/.dvb-stopped
 
 log() { printf '[dvb] %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
@@ -139,16 +142,38 @@ declare -a STOPPED=()
 restart_stopped() {
   if ((${#STOPPED[@]})); then
     log "starting ${#STOPPED[@]} container(s) again"
-    docker start "${STOPPED[@]}" >/dev/null || log "WARNING: failed to start some containers: ${STOPPED[*]}"
+    if docker start "${STOPPED[@]}" >/dev/null; then
+      rm -f "$STOPPED_FILE"
+    else
+      log "WARNING: failed to start some containers: ${STOPPED[*]}"
+    fi
     STOPPED=()
+  else
+    rm -f "$STOPPED_FILE"
   fi
+}
+
+# If a previous backup run was killed between stopping the application
+# containers and starting them again (SIGKILL, OOM, daemon restart), the
+# stopped-containers list survives on the staging volume; start them now.
+recover_stopped() {
+  [[ -s "$STOPPED_FILE" ]] || { rm -f "$STOPPED_FILE"; return 0; }
+  log "found containers left stopped by an interrupted backup; starting them"
+  local id
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    docker start "$id" >/dev/null 2>&1 \
+      || log "WARNING: could not start container $id (it may no longer exist)"
+  done <"$STOPPED_FILE"
+  rm -f "$STOPPED_FILE"
 }
 
 cmd_backup() {
   exec 9>"$LOCK_FILE"
-  flock -n 9 || { log "another backup run is still in progress; skipping"; exit 0; }
+  flock -n 9 || { log "another backup or restore is still in progress; skipping"; exit 0; }
 
   inspect_self
+  recover_stopped
   discover_volumes
   if ((${#VOL_REAL[@]} == 0)); then
     log "no named volumes found in project '$PROJECT'; nothing to back up"
@@ -170,25 +195,44 @@ cmd_backup() {
   trap restart_stopped EXIT
   if ((${#users[@]})); then
     log "stopping ${#users[@]} container(s) using the volumes"
+    printf '%s\n' "${users[@]}" >"$STOPPED_FILE"
     docker stop -t "$BACKUP_STOP_TIMEOUT" "${users[@]}" >/dev/null
     STOPPED=("${users[@]}")
   fi
 
   # Copy volume contents to the staging volume (fast, local) while the
   # containers are down.
-  local i name real
+  local i name real state
   for i in "${!VOL_REAL[@]}"; do
     real=${VOL_REAL[$i]} name=${VOL_NAME[$i]}
-    if [[ "$(probe_volume "$real")" == EMPTY ]]; then
+    state=$(probe_volume "$real")
+    if [[ "$state" == EMPTY ]]; then
       # Remember that this volume is intentionally empty, so a fresh deploy
       # will not look for data to restore into it.
       log "volume '$name' is empty; writing init marker"
       helper "$real:/vol" -- "touch '/vol/$MARKER'"
+    elif [[ "$state" == MARKER ]]; then
+      # Drop the marker again once real data has appeared, so it doesn't get
+      # carried around in backups and restores forever.
+      helper "$real:/vol" -- \
+        "if [ -n \"\$(ls -A /vol | grep -vx '$MARKER')\" ]; then rm -f '/vol/$MARKER'; fi"
     fi
     log "staging volume '$name' ($real)"
     mkdir -p "$STAGING_DIR/$name"
     helper "$real:/vol:ro" "$STAGING_VOL:$STAGING_DIR" -- \
       "rsync -aH --delete /vol/ '$STAGING_DIR/$name/'"
+  done
+
+  # Drop staging directories of volumes that no longer exist in the project
+  # (removed or excluded), so they don't consume staging space forever.
+  local d keep
+  for d in "$STAGING_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    d=${d%/} keep=
+    for name in "${VOL_NAME[@]}"; do
+      [[ "$d" == "$STAGING_DIR/$name" ]] && { keep=1; break; }
+    done
+    [[ -n "$keep" ]] || { log "removing stale staging directory '${d##*/}'"; rm -rf "$d"; }
   done
 
   # Start the containers again before uploading: the upload happens in the
@@ -210,6 +254,12 @@ cmd_backup() {
 # Restore (automatic disaster recovery on fresh deploys)
 # --------------------------------------------------------------------------
 cmd_restore() {
+  # Waits for a running backup (rather than skipping) so the two never race
+  # over the staging directories.
+  exec 8>"$LOCK_FILE"
+  flock 8
+
+  recover_stopped
   discover_volumes
   if ((${#VOL_REAL[@]} == 0)); then
     log "no named volumes found in project '$PROJECT'"
@@ -228,19 +278,28 @@ cmd_restore() {
       DATA)
         log "volume '$name' contains data; skipping restore" ;;
       EMPTY)
-        snaps=$(restic_cmd snapshots --json --latest 1 --path "$STAGING_DIR/$name" 2>/dev/null | jq -r 'if . == null then 0 else length end')
+        # Scoped to this project's own snapshots (--host): different compose
+        # projects sharing a bucket stage to identical paths, and one project
+        # must never restore another's data.
+        snaps=$(restic_cmd snapshots --json --host "$PROJECT" --latest 1 --path "$STAGING_DIR/$name") \
+          || die "cannot list snapshots for volume '$name'"
+        snaps=$(jq -r 'if . == null then 0 else length end' <<<"$snaps")
         if [[ "$snaps" == 0 ]]; then
           log "volume '$name' is empty and has no backups; leaving it for the application to initialize"
           continue
         fi
         log "volume '$name' is empty and a backup exists; restoring latest snapshot"
         rm -rf "${STAGING_DIR:?}/${name:?}"
-        restic_cmd restore latest --path "$STAGING_DIR/$name" --target /
+        restic_cmd restore latest --host "$PROJECT" --path "$STAGING_DIR/$name" --target /
         helper "$real:/vol" "$STAGING_VOL:$STAGING_DIR:ro" -- \
           "rsync -aH '$STAGING_DIR/$name/' /vol/"
         log "volume '$name' restored" ;;
     esac
   done
+
+  # Release the lock explicitly: cmd_start execs into crond, which would
+  # otherwise inherit the open fd and hold the lock forever.
+  exec 8>&-
 }
 
 # --------------------------------------------------------------------------
@@ -248,6 +307,10 @@ cmd_restore() {
 # --------------------------------------------------------------------------
 cmd_start() {
   log "docker-volume-backup starting (repository: $RESTIC_REPOSITORY, encryption: $([[ -n "${RESTIC_PASSWORD:-}" ]] && echo on || echo off))"
+
+  # /tmp survives a plain container restart; don't let a stale ready file
+  # report health before this run's restore pass has finished.
+  rm -f "$READY_FILE"
 
   local i
   for i in $(seq 1 30); do
