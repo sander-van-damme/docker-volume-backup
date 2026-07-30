@@ -83,6 +83,13 @@ ok "app volume restored"
   || fail "media volume should only contain the marker"
 ok "empty volume restored as intentionally-empty"
 
+step "verifying the marker is removed once real data appears"
+"${COMPOSE[@]}" exec -T media-user sh -c 'echo x > /srv/media/file.txt'
+"${COMPOSE[@]}" exec -T backup dvb backup
+"${COMPOSE[@]}" exec -T media-user test ! -f /srv/media/.docker-volume-backup.init \
+  || fail "init marker still present after data appeared in media volume"
+ok "marker removed"
+
 step "waiting for a cron-scheduled backup (schedule: every minute)"
 before=$("${COMPOSE[@]}" exec -T backup dvb restic snapshots --json | tr -d '[:space:]')
 for i in $(seq 1 15); do
