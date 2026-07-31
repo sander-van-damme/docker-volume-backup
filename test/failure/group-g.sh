@@ -15,7 +15,7 @@ cleanup
 minio_up || exit 1
 
 # ---------------------------------------------------------------------------
-step "G1 — are 'external: true' volumes backed up?"
+step "G1 — 'external: true' volumes are out of scope (documented behaviour)"
 docker volume create dvblab-important >/dev/null
 COMPOSE_FILE=$LAB/external.yml; PROJ=dvblabgx
 dc up -d --wait --wait-timeout 150 >/dev/null 2>&1
@@ -24,13 +24,26 @@ out=$(dc exec -T backup dvb backup 2>&1)
 info "$(grep 'volumes:' <<<"$out")"
 info "volume labels on the external volume: $(docker volume inspect dvblab-important -f '{{.Labels}}')"
 if grep -q "important" <<<"$out"; then
-  ok "the external volume was included in the backup"
+  bad "the external volume was backed up; the documented contract is that it is skipped"
 else
-  bad "the external volume was silently skipped — only $(grep -o 'volumes: .*' <<<"$out") was backed up"
-  note "G1: volume discovery filters on 'label=com.docker.compose.project'. A volume declared 'external: true' is not created by compose and normally carries no compose labels, so it is silently excluded from every backup. Nothing in the log says a volume was skipped — the run just reports the volumes it did find. The README's discovery section cites external volumes as a case the label-based lookup handles, which holds only when the external volume happens to have been created by some other compose project"
+  ok "the external volume is skipped, as documented"
+  note "G1: an unlabelled external volume is skipped silently — the log lists the volumes that were found, never the ones that were not. Coverage is worth checking against that log line after any change to a stack's volumes"
 fi
 snaps=$(dc exec -T backup dvb restic snapshots --json 2>/dev/null | jq -r '[.[].paths[]]|unique|join(" ")')
 info "paths actually present in the repository: $snaps"
+
+step "G1b — the documented opt-in: labelling an external volume brings it in"
+nuke dvblabgx "$LAB/external.yml"; docker volume rm -f dvblab-important >/dev/null 2>&1
+docker volume create \
+  --label com.docker.compose.project=dvblabgx \
+  --label com.docker.compose.volume=important dvblab-important >/dev/null
+dc up -d --wait --wait-timeout 150 >/dev/null 2>&1
+docker exec $PROJ-app-1 sh -c 'echo IRREPLACEABLE > /ext/payload'
+out=$(dc exec -T backup dvb backup 2>&1)
+info "$(grep 'volumes:' <<<"$out")"
+grep -q "important" <<<"$out" \
+  && ok "a labelled external volume is discovered and backed up" \
+  || bad "labelling the external volume did not bring it into the backup"
 nuke dvblabgx "$LAB/external.yml"; docker volume rm -f dvblab-important >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
@@ -115,6 +128,22 @@ docker rm -f dvbg-stubborn >/dev/null 2>&1
 docker volume rm -f ${PROJ}_stubborn-data >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
+step "G6 — upgrade path: a volume left holding an old .docker-volume-backup.init marker"
+docker volume create -d local --label com.docker.compose.project=$PROJ \
+  --label com.docker.compose.volume=legacy-data ${PROJ}_legacy-data >/dev/null
+docker run --rm -v ${PROJ}_legacy-data:/v alpine:3.22 touch /v/.docker-volume-backup.init
+out=$(docker exec $PROJ-backup-1 dvb backup 2>&1)
+grep -q "legacy-data" <<<"$out" && ok "the legacy volume is picked up for backup" \
+                                || bad "legacy volume not discovered"
+staged=$(docker exec $PROJ-backup-1 sh -c 'ls -A /staging/legacy-data | wc -l' | tr -d ' ')
+check "the old marker is not carried into new backups" "0" "$staged"
+out=$(docker exec $PROJ-backup-1 dvb restore 2>&1)
+grep "legacy-data" <<<"$out" | sed 's/^/       /'
+grep -q "volume 'legacy-data' contains data" <<<"$out" \
+  && bad "a marker-only volume is still mistaken for a volume holding real data" \
+  || ok "a marker-only volume is treated as empty, not as data"
+docker volume rm -f ${PROJ}_legacy-data >/dev/null 2>&1
+
 step "G5 — 'dvb restic' escape hatch and the docs' manual-operations commands"
 for c in "snapshots" "stats" "check"; do
   docker exec $PROJ-backup-1 dvb restic $c >/dev/null 2>&1 \

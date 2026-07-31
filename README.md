@@ -14,10 +14,29 @@ deploy** — a simple form of disaster recovery.
   the docker socket, reads its `com.docker.compose.project` label and lists
   all volumes carrying that project label. No custom labels or configuration
   needed, and no guessing of host volume names (a compose volume `example`
-  may be called `example-y1fal5` or `myproject_example` on the host — the
-  labels are authoritative, the name never matters). Bind mounts and
-  anonymous volumes are not backed up. Volumes mounted into the backup
+  may be called `myproject_example` on the host — the labels are
+  authoritative, the name never matters). Volumes mounted into the backup
   container itself (the staging volume) are excluded automatically.
+
+  **What is not backed up:** bind mounts, anonymous volumes, and volumes
+  declared `external: true`. Compose does not create external volumes, so
+  they carry no `com.docker.compose.project` label and the discovery query
+  never sees them — they are skipped silently, and the log simply lists the
+  volumes that *were* found. That is by design: an external volume is
+  explicitly shared or managed outside this stack, and its lifecycle is not
+  this project's to own. If you want one backed up here, either declare it as
+  an ordinary compose volume, or give it the labels yourself when you create
+  it:
+
+  ```sh
+  docker volume create \
+    --label com.docker.compose.project=myproject \
+    --label com.docker.compose.volume=shared-data \
+    shared-data
+  ```
+
+  Check what is actually covered with `docker compose exec backup dvb backup`,
+  which logs the volume list it discovered, or `dvb restic snapshots`.
 
 - **Minimal downtime.** At each scheduled backup, every running container
   that uses one of the volumes is stopped, the volume contents are copied to
@@ -39,13 +58,18 @@ deploy** — a simple form of disaster recovery.
     initialize.
 
   Volumes that are *intentionally* empty (e.g. a media volume that never got
-  content) get a `.docker-volume-backup.init` marker file at backup time, so
-  a fresh deploy remembers they are supposed to be empty and doesn't keep
-  looking for data to restore. The marker is only ever written to volumes
-  that are already empty while their containers run, so it never interferes
-  with applications (like PostgreSQL) that require an empty directory to
-  initialize. Once real data appears in the volume, the next backup removes
-  the marker again.
+  content) need no special handling: an empty volume is backed up as an empty
+  snapshot, and restoring that snapshot on a fresh deploy correctly leaves the
+  volume empty. Backups never write anything into your volumes — during a
+  backup they are mounted read-only — so a volume belonging to a service that
+  has not been started yet cannot be disturbed either.
+
+  > Versions up to and including 1.x wrote a `.docker-volume-backup.init`
+  > marker file into empty volumes instead. That file is no longer created;
+  > it is ignored where it already exists and dropped from new backups. If an
+  > old marker ended up in the data directory of a database that then refused
+  > to initialize (`directory exists but is not empty`), delete the file once
+  > and the service will start.
 
 ## Usage
 

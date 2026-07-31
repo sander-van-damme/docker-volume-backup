@@ -10,7 +10,7 @@ unreachable, crash recovery of stopped containers, exact file-level fidelity
 through a disaster restore, and correct per-project scoping in a shared
 bucket.
 
-What follows is what broke.
+What follows is what broke. The table is the initial run, before any fixes.
 
 | Group | Scenario | Pass | Genuine failures |
 |---|---|---|---|
@@ -24,9 +24,12 @@ What follows is what broke.
 
 ---
 
+Findings 1 and 2 have since been addressed; the rest are still open. Each is
+marked accordingly.
+
 ## High
 
-### 1. The init marker can permanently break a service that has not started yet (G2)
+### 1. The init marker can permanently break a service that has not started yet (G2) — FIXED
 
 `cmd_backup` writes `.docker-volume-backup.init` into every volume that is
 empty at backup time. The README says this "never interferes with
@@ -47,12 +50,22 @@ The database then never starts, and the marker is now in the backups as
 well. Adding a database service to an existing stack and letting one
 scheduled backup run before its first start is enough to trigger this.
 
-Suggested fix: only write the marker for volumes that at least one container
-in the project actually mounts (the container list is already computed for
-the stop step), or write it only for volumes that were empty on a previous
-backup too.
+**Fixed** by dropping the marker altogether. It turned out to be redundant:
+an empty volume is already backed up as an empty snapshot, and restoring that
+snapshot on a fresh deploy leaves the volume empty — which is exactly what
+the marker was there to record. Verified directly against restic: an empty
+directory produces a snapshot, restores as an empty directory, and rsyncs
+into the volume as a no-op.
 
-### 2. `external: true` volumes are silently never backed up (G1)
+Application volumes are now mounted read-only during a backup without
+exception, so the backup path can no longer modify the data it is copying.
+A marker left behind by an older version is ignored (a volume holding
+nothing else counts as empty) and excluded from new snapshots, so existing
+deployments converge on their own. Regression guards live in
+`test/run-test.sh` (an undeployed service's volume must stay untouched) and
+in G6 below (the upgrade path).
+
+### 2. `external: true` volumes are silently never backed up (G1) — DOCUMENTED
 
 Volume discovery filters on `label=com.docker.compose.project`. A volume
 declared `external: true` is not created by compose and carries no compose
@@ -69,16 +82,20 @@ volumes it did find, and looks entirely successful. External volumes are a
 common way to protect data from `compose down -v`, which makes this exactly
 the data an operator is least willing to lose.
 
-The README's discovery section cites external volumes (`example-y1fal5`) as
-a case the label lookup handles; that is true only when the external volume
-happens to have been created by some *other* compose project.
+**Resolved as intended behaviour, now documented.** An external volume is
+managed outside the stack, so its lifecycle is not this project's to own.
+The README's discovery section previously cited external volumes as a case
+the label lookup handles, which was misleading; it now states plainly that
+they are out of scope, alongside bind mounts and anonymous volumes, and
+gives the opt-in for operators who do want one covered — create it with
+`com.docker.compose.project` and `com.docker.compose.volume` labels. G1b
+verifies that opt-in works.
 
-Suggested fix: cross-check the volumes actually mounted by the project's
-containers against the label query and warn loudly about any that are
-mounted but unlabelled, or resolve external volumes through the service
-definitions.
+What remains true is that the skip is silent: the log lists the volumes that
+were found, never the ones that were not. Checking that list after changing
+a stack's volumes is the only way to confirm coverage.
 
-### 3. An unreadable repository is mistaken for a missing one (D6 / H1)
+### 3. An unreadable repository is mistaken for a missing one (D6 / H1) — OPEN
 
 `ensure_repo` cannot distinguish "no repository here" from "cannot open this
 repository". It runs `restic init`, gets `config file already exists`, and
@@ -121,7 +138,7 @@ Suggested fix: only fall through to `init` when the failure looks like a
 missing repository, and treat "config file already exists" after a failed
 `cat config` as fatal rather than as success.
 
-### 4. A hung upload silently stops all future backups (F4)
+### 4. A hung upload silently stops all future backups (F4) — OPEN
 
 `ensure_repo` bounds its probe with `timeout 30`, but the upload phase
 (`restic backup` / `forget --prune`) has no timeout. Against an endpoint that
@@ -147,7 +164,7 @@ once N consecutive scheduled runs have been skipped or have failed.
 
 ## Medium
 
-### 5. `depends_on` mistakes fork the data silently (C1, C2)
+### 5. `depends_on` mistakes fork the data silently (C1, C2) — OPEN
 
 This is the documented requirement, and the failure mode is exactly as
 severe as the README implies — but it is completely silent.
@@ -182,7 +199,7 @@ it can be made loud. When a volume contains data, has no init marker, and a
 snapshot for it exists in the repository, log a `WARNING` rather than an
 informational "skipping restore" line.
 
-### 6. An invalid `BACKUP_CRON` leaves a healthy container that never backs up (D8)
+### 6. An invalid `BACKUP_CRON` leaves a healthy container that never backs up (D8) — OPEN
 
 `BACKUP_CRON` is written into the crontab unvalidated:
 
@@ -198,7 +215,7 @@ environment variable becomes an open-ended, silent backup outage.
 Suggested fix: validate the five fields before writing the crontab and
 `die` on a malformed schedule.
 
-### 7. An operator stopping dvb mid-backup takes the whole stack down (B1b)
+### 7. An operator stopping dvb mid-backup takes the whole stack down (B1b) — OPEN
 
 Crash recovery itself works well (B1, B2, B6 — see below). But it only runs
 when the backup container comes back, and docker treats `docker kill`,
@@ -218,7 +235,7 @@ Suggested fix: document it, and consider trapping `SIGTERM`/`SIGINT` during
 the stop window so a graceful stop restarts the application containers on
 the way out.
 
-### 8. The staging-volume guard is unreachable (D5)
+### 8. The staging-volume guard is unreachable (D5) — OPEN
 
 `dvb` dies with `no volume is mounted at /staging` if the operator forgets
 the staging volume — except that can never happen, because the Dockerfile's

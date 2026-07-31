@@ -4,7 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-COMPOSE=(docker compose -f docker-compose.test.yml -p dvbtest)
+PROJECT=dvbtest
+COMPOSE=(docker compose -f docker-compose.test.yml -p "$PROJECT")
 MINIO=dvb-minio
 NET=dvb-s3
 
@@ -54,10 +55,22 @@ step "verifying containers were restarted after backup"
   || fail "not all services running after backup"
 ok "all services running"
 
-step "verifying init marker on intentionally-empty volume"
-"${COMPOSE[@]}" exec -T media-user test -f /srv/media/.docker-volume-backup.init \
-  || fail "init marker missing on empty media volume"
-ok "marker present"
+step "verifying an empty volume is left untouched by the backup"
+[ -z "$("${COMPOSE[@]}" exec -T media-user ls -A /srv/media)" ] \
+  || fail "backup wrote something into the intentionally-empty media volume"
+ok "empty volume still empty"
+
+step "verifying a volume with no running container is left untouched too"
+# Regression guard: a volume whose service has not been deployed yet must not
+# get anything written into it, or services like postgres can never initialize.
+docker volume create -d local \
+  --label com.docker.compose.project=$PROJECT \
+  --label com.docker.compose.volume=unused ${PROJECT}_unused >/dev/null
+"${COMPOSE[@]}" exec -T backup dvb backup
+[ -z "$(docker run --rm -v ${PROJECT}_unused:/v alpine:3.22 ls -A /v)" ] \
+  || fail "backup wrote into the volume of a service that is not running"
+ok "undeployed service's volume untouched"
+docker volume rm -f ${PROJECT}_unused >/dev/null
 
 step "running a second backup (incremental)"
 "${COMPOSE[@]}" exec -T backup dvb backup
@@ -77,18 +90,19 @@ ok "database restored from backup"
   || fail "app volume not restored"
 ok "app volume restored"
 
-"${COMPOSE[@]}" exec -T media-user test -f /srv/media/.docker-volume-backup.init \
-  || fail "init marker not restored on media volume"
-[ -z "$("${COMPOSE[@]}" exec -T media-user ls -A /srv/media | grep -v '^\.docker-volume-backup.init$')" ] \
-  || fail "media volume should only contain the marker"
-ok "empty volume restored as intentionally-empty"
+[ -z "$("${COMPOSE[@]}" exec -T media-user ls -A /srv/media)" ] \
+  || fail "media volume should have come back empty, not $("${COMPOSE[@]}" exec -T media-user ls -A /srv/media)"
+ok "intentionally-empty volume restored as empty"
 
-step "verifying the marker is removed once real data appears"
-"${COMPOSE[@]}" exec -T media-user sh -c 'echo x > /srv/media/file.txt'
+step "verifying data appearing later in that volume is backed up and restored"
+"${COMPOSE[@]}" exec -T media-user sh -c 'echo late-arrival > /srv/media/file.txt'
 "${COMPOSE[@]}" exec -T backup dvb backup
-"${COMPOSE[@]}" exec -T media-user test ! -f /srv/media/.docker-volume-backup.init \
-  || fail "init marker still present after data appeared in media volume"
-ok "marker removed"
+"${COMPOSE[@]}" down -v
+"${COMPOSE[@]}" up -d --build --wait --wait-timeout 180
+sleep 5
+got=$("${COMPOSE[@]}" exec -T media-user cat /srv/media/file.txt | tr -d '\r\n')
+[ "$got" = "late-arrival" ] || fail "media volume not restored (got: '$got')"
+ok "previously-empty volume restored with its new data"
 
 step "waiting for a cron-scheduled backup (schedule: every minute)"
 before=$("${COMPOSE[@]}" exec -T backup dvb restic snapshots --json | tr -d '[:space:]')

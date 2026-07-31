@@ -63,6 +63,7 @@ COMPOSE_FILE=$LAB/stack.yml
 PROJ=dvblabe
 step "E2 — file-level fidelity through a full backup/disaster/restore cycle"
 dc up -d --wait --wait-timeout 150 >/dev/null 2>&1
+for i in $(seq 1 90); do dc exec -T db pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
 docker exec $PROJ-app-1 sh -c '
   set -e
   mkdir -p "/data/nested/deep dir" /data/emptydir
@@ -87,12 +88,13 @@ sig() { docker exec $PROJ-app-1 sh -c '
 '; }
 before=$(sig)
 info "captured $(wc -l <<<"$before") filesystem entries"
-dc exec -T db psql -U postgres -c "CREATE TABLE t (msg text); INSERT INTO t VALUES ('e-payload');" >/dev/null 2>&1
+dc exec -T db psql -U postgres -c "CREATE TABLE t (msg text); INSERT INTO t VALUES ('e-payload');" >/dev/null \
+  || bad "could not seed the database"
 dc exec -T backup dvb backup >/dev/null 2>&1 && ok "backup of the fidelity fixture ok" || bad "backup failed"
 
 dc down -v --timeout 5 >/dev/null 2>&1
 dc up -d --wait --wait-timeout 180 >/dev/null 2>&1
-sleep 3
+for i in $(seq 1 90); do dc exec -T db pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
 after=$(sig)
 if [ "$before" = "$after" ]; then
   ok "every file, mode, owner, symlink, hardlink and fifo survived the round trip"

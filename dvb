@@ -28,7 +28,11 @@ set -euo pipefail
 export TZ
 
 STAGING_DIR=/staging
-MARKER=.docker-volume-backup.init
+# Earlier versions wrote this file into empty volumes to record "intentionally
+# empty". Nothing produces it any more (an empty snapshot says the same thing
+# without touching the volume), but it is still recognised and ignored so
+# existing deployments converge without manual cleanup.
+LEGACY_MARKER=.docker-volume-backup.init
 ENV_FILE=/run/dvb.env
 READY_FILE=/tmp/dvb-ready
 LOCK_FILE=/tmp/dvb.lock
@@ -129,10 +133,11 @@ helper() { # helper <volume:mountspec>... -- <sh -c command>
   docker run --rm --network none --entrypoint sh "${mounts[@]}" "$SELF_IMAGE" -c "$1"
 }
 
-# Prints MARKER, DATA or EMPTY for a volume.
+# Prints DATA or EMPTY for a volume. A volume holding nothing but the legacy
+# init marker counts as empty: the marker is not data anyone put there.
 probe_volume() {
   helper "$1:/vol:ro" -- \
-    "if [ -e '/vol/$MARKER' ]; then echo MARKER; elif [ -n \"\$(ls -A /vol)\" ]; then echo DATA; else echo EMPTY; fi"
+    "if [ -n \"\$(ls -A /vol | grep -vx '$LEGACY_MARKER')\" ]; then echo DATA; else echo EMPTY; fi"
 }
 
 # --------------------------------------------------------------------------
@@ -202,25 +207,19 @@ cmd_backup() {
 
   # Copy volume contents to the staging volume (fast, local) while the
   # containers are down.
-  local i name real state
+  # Application volumes are mounted read-only here, without exception. An
+  # empty volume simply produces an empty snapshot, and that is what tells a
+  # later fresh deploy the volume is meant to stay empty — so there is never
+  # a reason to write into a volume we are backing up. (Writing a marker into
+  # empty volumes, as earlier versions did, could land in the data directory
+  # of a service that had not been started yet and stop it from initializing.)
+  local i name real
   for i in "${!VOL_REAL[@]}"; do
     real=${VOL_REAL[$i]} name=${VOL_NAME[$i]}
-    state=$(probe_volume "$real")
-    if [[ "$state" == EMPTY ]]; then
-      # Remember that this volume is intentionally empty, so a fresh deploy
-      # will not look for data to restore into it.
-      log "volume '$name' is empty; writing init marker"
-      helper "$real:/vol" -- "touch '/vol/$MARKER'"
-    elif [[ "$state" == MARKER ]]; then
-      # Drop the marker again once real data has appeared, so it doesn't get
-      # carried around in backups and restores forever.
-      helper "$real:/vol" -- \
-        "if [ -n \"\$(ls -A /vol | grep -vx '$MARKER')\" ]; then rm -f '/vol/$MARKER'; fi"
-    fi
     log "staging volume '$name' ($real)"
     mkdir -p "$STAGING_DIR/$name"
     helper "$real:/vol:ro" "$STAGING_VOL:$STAGING_DIR" -- \
-      "rsync -aH --delete /vol/ '$STAGING_DIR/$name/'"
+      "rsync -aH --delete --exclude '/$LEGACY_MARKER' /vol/ '$STAGING_DIR/$name/'"
   done
 
   # Drop staging directories of volumes that no longer exist in the project
@@ -272,29 +271,30 @@ cmd_restore() {
   for i in "${!VOL_REAL[@]}"; do
     real=${VOL_REAL[$i]} name=${VOL_NAME[$i]}
     state=$(probe_volume "$real")
-    case "$state" in
-      MARKER)
-        log "volume '$name' already initialized; skipping restore" ;;
-      DATA)
-        log "volume '$name' contains data; skipping restore" ;;
-      EMPTY)
-        # Scoped to this project's own snapshots (--host): different compose
-        # projects sharing a bucket stage to identical paths, and one project
-        # must never restore another's data.
-        snaps=$(restic_cmd snapshots --json --host "$PROJECT" --latest 1 --path "$STAGING_DIR/$name") \
-          || die "cannot list snapshots for volume '$name'"
-        snaps=$(jq -r 'if . == null then 0 else length end' <<<"$snaps")
-        if [[ "$snaps" == 0 ]]; then
-          log "volume '$name' is empty and has no backups; leaving it for the application to initialize"
-          continue
-        fi
-        log "volume '$name' is empty and a backup exists; restoring latest snapshot"
-        rm -rf "${STAGING_DIR:?}/${name:?}"
-        restic_cmd restore latest --host "$PROJECT" --path "$STAGING_DIR/$name" --target /
-        helper "$real:/vol" "$STAGING_VOL:$STAGING_DIR:ro" -- \
-          "rsync -aH '$STAGING_DIR/$name/' /vol/"
-        log "volume '$name' restored" ;;
-    esac
+    if [[ "$state" == DATA ]]; then
+      log "volume '$name' contains data; skipping restore"
+      continue
+    fi
+
+    # Scoped to this project's own snapshots (--host): different compose
+    # projects sharing a bucket stage to identical paths, and one project
+    # must never restore another's data.
+    snaps=$(restic_cmd snapshots --json --host "$PROJECT" --latest 1 --path "$STAGING_DIR/$name") \
+      || die "cannot list snapshots for volume '$name'"
+    snaps=$(jq -r 'if . == null then 0 else length end' <<<"$snaps")
+    if [[ "$snaps" == 0 ]]; then
+      log "volume '$name' is empty and has no backups; leaving it for the application to initialize"
+      continue
+    fi
+
+    # The snapshot of a volume that was empty at backup time is itself empty,
+    # so this restores nothing and correctly leaves the volume empty.
+    log "volume '$name' is empty and a backup exists; restoring latest snapshot"
+    rm -rf "${STAGING_DIR:?}/${name:?}"
+    restic_cmd restore latest --host "$PROJECT" --path "$STAGING_DIR/$name" --target /
+    helper "$real:/vol" "$STAGING_VOL:$STAGING_DIR:ro" -- \
+      "rsync -aH '$STAGING_DIR/$name/' /vol/"
+    log "volume '$name' restored"
   done
 
   # Release the lock explicitly: cmd_start execs into crond, which would
